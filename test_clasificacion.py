@@ -1609,7 +1609,7 @@ class TestXlsxSinColgarTrasTemas(unittest.TestCase):
             "Título": ["Alpha uno", "Beta dos"],
             "Resumen - Aclaracion": ["Resumen A", "Resumen B"],
             "Tono IA": ["Positivo", "Neutro"],
-            "Tema": ["Tema A", "Tema B"],
+            "Tema": ["Educación superior", "Formación profesional"],
             "Subtema": ["Lanzamiento de carrera deportiva", "Lanzamiento de carrera deportiva"],
         })
         with patch.object(app, "construir_grafo_equivalencia",

@@ -6,7 +6,6 @@ _MODELO_OVERRIDE_MSG = ""
 MAX_LLM_CALLS_POR_ETIQUETA = 0
 MAX_PALABRAS_FRASE_EVENTO = 8
 MAX_PALABRAS_SUBTEMA = 8
-NUM_TEMAS_MAX = 25
 TAMANO_LOTE_LLM_SUBTEMA = 30
 TAMANO_LOTE_LLM_TEMA = 30
 MAX_TOKENS_LOTE_SUBTEMA = 800
@@ -1734,153 +1733,78 @@ def _temas_nucleo_incompatible(a, b) -> bool:
 
 
 def _nombre_tema_heuristico(subtemas_grupo, textos_muestra, marca=""):
+    """Encabezado editorial más general que los subtemas (dominio, no collage)."""
+    subs = [str(s).strip() for s in (subtemas_grupo or []) if str(s).strip()]
     blob = " ".join(str(t) for t in (textos_muestra or [])[:4])
-    heur = _extraer_tema_especifico((subtemas_grupo or [""])[0], blob, marca)
-    if heur and _validar_estructura_tema(heur) and not _tema_es_igual_a_subtema(heur, subtemas_grupo):
-        return capitalizar_etiqueta(heur)
-    if len(subtemas_grupo) == 1:
-        p = str(subtemas_grupo[0]).split()
-        rec = _recortar_frase_completa(" ".join(p), max_palabras=3) if len(p) > 3 else subtemas_grupo[0]
-        if rec and not _tema_es_igual_a_subtema(rec, subtemas_grupo):
+    votos = []
+    for sub in (subs or [""]):
+        if _es_subtema_autoria(sub):
+            return capitalizar_etiqueta(TEMA_ESTUDIANTES_EGRESADOS)
+        heur = _extraer_tema_especifico(sub, blob, marca)
+        if (
+            heur
+            and _validar_estructura_tema(heur)
+            and not _tema_es_igual_a_subtema(heur, subs or [sub])
+        ):
+            votos.append(capitalizar_etiqueta(_sin_comas_etiqueta(heur)))
+    if votos:
+        return Counter(votos).most_common(1)[0][0]
+    sub0 = subs[0] if subs else ""
+    palabras = sub0.split()
+    for maxp in (3, 2):
+        if len(palabras) > maxp:
+            rec = _recortar_frase_completa(sub0, max_palabras=maxp)
+            if (
+                rec
+                and _validar_estructura_tema(rec)
+                and not _tema_es_igual_a_subtema(rec, subs)
+            ):
+                return capitalizar_etiqueta(rec)
+    if len(palabras) >= 3:
+        rec = " ".join(palabras[:2])
+        if rec and string_norm_label(rec) != string_norm_label(sub0):
             return capitalizar_etiqueta(rec)
-    return capitalizar_etiqueta(heur or (subtemas_grupo[0] if subtemas_grupo else "Hecho de la noticia"))
-
-
-def _capar_temas_alrededor_de_25(mt, textos_por_subtema, num_max=25):
-    """Merge similar temas down to ~25, never mixing incompatible núcleos."""
-    invert = defaultdict(list)
-    for sub, tema in mt.items():
-        invert[tema].append(sub)
-    if len(invert) <= num_max + 4:
-        return mt
-    nombres = list(invert.keys())
-    embs = get_embeddings_batch(nombres)
-    parent = list(range(len(nombres)))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    pares = []
-    for i in range(len(nombres)):
-        for j in range(i + 1, len(nombres)):
-            if _temas_nucleo_incompatible(nombres[i], nombres[j]):
-                continue
-            sim = _cos_par(embs[i], embs[j]) if embs[i] is not None and embs[j] is not None else 0.0
-            lex = SequenceMatcher(None, string_norm_label(nombres[i]), string_norm_label(nombres[j])).ratio()
-            pares.append((max(sim, lex), i, j))
-    pares.sort(reverse=True)
-    n_grupos = len(nombres)
-    for sim, i, j in pares:
-        if n_grupos <= num_max:
-            break
-        if find(i) == find(j):
-            continue
-        if sim < 0.72:
-            break
-        union(i, j)
-        n_grupos -= 1
-    canon = {}
-    grupos = defaultdict(list)
-    for i, nom in enumerate(nombres):
-        grupos[find(i)].append(nom)
-    for members in grupos.values():
-        best = max(members, key=lambda n: (len(invert[n]), -len(n.split())))
-        for m in members:
-            canon[m] = best
-    return {sub: canon.get(tema, tema) for sub, tema in mt.items()}
+    return capitalizar_etiqueta("Hecho institucional relevante")
 
 
 def consolidar_temas(subtemas, textos, pbar, marca="", embs=None):
-    n = len(textos)
-    u = _umbrales_adaptativos(n)
+    """Temas = headings más generales que los subtemas.
+
+    Sin tope de 25, sin clustering n² de subtemas únicos, sin LLM por tema
+    y sin un segundo pase de embeddings sobre las etiquetas. `embs` se
+    acepta por compatibilidad; no se re-embebe ni se usa para recortar.
+    """
     pbar = pbar or _PBarNulo()
-    pbar.progress(0.05, "Temas · preparando")
     us = list(dict.fromkeys(subtemas))
-    if len(us) <= 1:
-        pbar.progress(1.0, "Temas · un tema")
+    k_total = len(us)
+    pbar.progress(0.04, f"Temas 0/{k_total}")
+    if k_total <= 1:
+        pbar.progress(1.0, f"Temas {max(k_total, 1)}/{max(k_total, 1)}")
         return [capitalizar_etiqueta(_sin_comas_etiqueta(s)) for s in subtemas]
     textos_por_subtema = defaultdict(list)
     for i, sub in enumerate(subtemas):
         textos_por_subtema[sub].append(textos[i] if i < len(textos) else "")
-    ae = _embeddings_reusar(textos, embs)
-    centroids = {}
-    for sub in us:
-        idxs = [i for i, s in enumerate(subtemas) if s == sub][:50]
-        vecs = [ae[i] for i in idxs if i < len(ae) and ae[i] is not None]
-        if vecs:
-            centroids[sub] = np.mean(vecs, axis=0)
-    vs = [s for s in us if s in centroids]
-    pbar.progress(0.35, "Temas · clustering")
-    clusters = {i: [s] for i, s in enumerate(us)}
-    if len(vs) >= 2:
-        M = np.array([centroids[s] for s in vs])
-        sim = cosine_similarity(M)
-        dist = np.clip(1 - sim, 0, 2)
-        np.fill_diagonal(dist, 0)
-        cl = AgglomerativeClustering(
-            n_clusters=None, distance_threshold=1 - u["tema"],
-            metric="precomputed", linkage="average" if len(vs) > 6 else "complete",
-        ).fit(dist)
-        raw = defaultdict(list)
-        for i, lbl in enumerate(cl.labels_):
-            raw[lbl].append(vs[i])
-        clusters = {}
-        cid = 0
-        for subs_c in raw.values():
-            if len(subs_c) <= 1:
-                clusters[cid] = subs_c
-                cid += 1
-                continue
-            dsu = DSU(len(subs_c))
-            for i in range(len(subs_c)):
-                for j in range(i + 1, len(subs_c)):
-                    sa, sb = subs_c[i], subs_c[j]
-                    if _temas_nucleo_incompatible(sa, sb):
-                        continue
-                    if _grupos_contenido_compatibles(
-                        textos_por_subtema.get(sa, []), textos_por_subtema.get(sb, []),
-                        sa, sb, min_sim=max(u["tema"], 0.82), min_overlap=0.16,
-                    ):
-                        dsu.union(i, j)
-            for miembros in dsu.grupos(len(subs_c)).values():
-                clusters[cid] = [subs_c[i] for i in miembros]
-                cid += 1
-        leftover = [s for s in us if s not in vs]
-        for s in leftover:
-            clusters[cid] = [s]
-            cid += 1
     mt = {}
-    pbar.progress(0.55, f"Temas · nombres ({len(clusters)})")
-    for cid, subs_c in clusters.items():
-        nombre = _nombre_tema_heuristico(subs_c, textos_por_subtema.get(subs_c[0], []), marca)
-        if any(_es_subtema_autoria(s) for s in subs_c):
+    for k, sub in enumerate(us):
+        pbar.progress(0.08 + 0.82 * ((k + 1) / k_total), f"Temas {k + 1}/{k_total}")
+        nombre = _nombre_tema_heuristico([sub], textos_por_subtema.get(sub, []), marca)
+        if _es_subtema_autoria(sub):
             nombre = TEMA_ESTUDIANTES_EGRESADOS
-        for sub in subs_c:
-            mt[sub] = capitalizar_etiqueta(nombre)
-    mt = _capar_temas_alrededor_de_25(mt, textos_por_subtema, u.get("num_temas_max", NUM_TEMAS_MAX))
+        mt[sub] = capitalizar_etiqueta(_sin_comas_etiqueta(nombre))
     tf = [mt.get(s, s) for s in subtemas]
     tf = _unificar_tema_por_subtema(tf, subtemas)
     tf, _ = _aplicar_etiquetas_autoria(None, textos, tf, subtemas, marca)
     # Guard: acreditación never shares tema with estudiantes/egresados
-    for i, (tema, sub) in enumerate(zip(tf, subtemas)):
-        if _es_subtema_autoria(sub) or "egresad" in unidecode(str(sub).lower()) or "estudiante" in unidecode(str(sub).lower()):
+    for i, sub in enumerate(subtemas):
+        blob = unidecode(str(sub).lower())
+        if _es_subtema_autoria(sub) or "egresad" in blob or "estudiante" in blob:
             tf[i] = TEMA_ESTUDIANTES_EGRESADOS
-        elif re.search(r"acredit|certific|alta calidad", unidecode(str(sub).lower())):
+        elif re.search(r"acredit|certific|alta calidad", blob):
             if string_norm_label(tf[i]) == string_norm_label(TEMA_ESTUDIANTES_EGRESADOS):
                 tf[i] = "Acreditación institucional"
-            elif re.search(r"educacion\b", unidecode(str(tf[i]).lower())) and "estudiant" not in unidecode(str(tf[i]).lower()):
-                pass
     pbar.progress(1.0, f"Temas listos · {len(set(tf))}")
     try:
-        st.info(f"Temas: **{len(set(tf))}** (de {len(set(subtemas))} subtemas) · Máx: {NUM_TEMAS_MAX}")
+        st.info(f"Temas: **{len(set(tf))}** (de {len(set(subtemas))} subtemas)")
     except Exception:
         pass
     return [capitalizar_etiqueta(_sin_comas_etiqueta(t)) for t in tf]
@@ -2310,7 +2234,7 @@ def _umbrales_adaptativos(n: int) -> dict:
             subtema=0.86, tema=0.80, dedup_label=0.86, fusion_subtemas=0.88,
             fusion_intergrupo=0.90, min_pertenencia_subtema=0.66, min_pertenencia_tema=0.58,
             coherencia_etiqueta=0.38, sim_minima_agrupacion=0.86, sim_minima_keywords=0.86,
-            max_iter_fusion=3, num_temas_max=min(n // 2, NUM_TEMAS_MAX), usar_paso2b=True,
+            max_iter_fusion=3, num_temas_max=n, usar_paso2b=True,
             usar_fusion_iterativa=True, clustering_estricto=True,
         )
     return dict(
@@ -2318,7 +2242,7 @@ def _umbrales_adaptativos(n: int) -> dict:
         fusion_intergrupo=0.80, min_pertenencia_subtema=UMBRAL_MIN_PERTENENCIA_SUBTEMA,
         min_pertenencia_tema=UMBRAL_MIN_PERTENENCIA_TEMA, coherencia_etiqueta=UMBRAL_COHERENCIA_ETIQUETA,
         sim_minima_agrupacion=0.74, sim_minima_keywords=0.78, max_iter_fusion=MAX_ITER_FUSION,
-        num_temas_max=NUM_TEMAS_MAX, usar_paso2b=True, usar_fusion_iterativa=True,
+        num_temas_max=n, usar_paso2b=True, usar_fusion_iterativa=True,
         clustering_estricto=False,
     )
 

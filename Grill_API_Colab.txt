@@ -9,7 +9,8 @@
 # Embeddings: `text-embedding-3-small`.
 #
 # **Velocidad:** un solo pase de embeddings (`_txt`), sin O(n²) SequenceMatcher,
-# consistencia barata tras **Temas listos**, nombres heurísticos por defecto
+# consistencia barata tras **Temas listos** (reusa last_grupos, no reconstruye el grafo),
+# nombres heurísticos por defecto
 # (pulido LLM opcional: `GRILL_PULIR_SUBTEMAS=1` / `GRILL_PULIR_TEMAS=1`).
 # Tema claro: la zona de carga del Excel es enorme y de alto contraste.
 #
@@ -3443,6 +3444,48 @@ def construir_grafo_equivalencia(titulos, resumenes, contextos=None, marca="", a
         _revisar_par(i, j)
     return dsu
 
+_ETIQUETA_VACIA = {"", "nan", "none", "-", "n/a"}
+
+
+def _indices_validos_grupo(idxs, n):
+    out = []
+    for i in idxs or []:
+        try:
+            j = int(i)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= j < n:
+            out.append(j)
+    return out
+
+
+def _dsu_desde_last_grupos_y_subtema(n, grupos_noticia, df, subtema_col):
+    """Tras Temas listos: last_grupos + mismo Subtema. Sin grafo / SequenceMatcher."""
+    dsu = DSU(n)
+    if grupos_noticia:
+        for idxs in grupos_noticia.values():
+            idxs = _indices_validos_grupo(idxs, n)
+            if len(idxs) < 2:
+                continue
+            base = idxs[0]
+            for j in idxs[1:]:
+                dsu.union(base, j)
+    if subtema_col in df.columns:
+        por_sub = defaultdict(list)
+        for i in range(n):
+            sub = str(df.iloc[i][subtema_col]).strip()
+            if sub.lower() in _ETIQUETA_VACIA:
+                continue
+            por_sub[sub].append(i)
+        for idxs in por_sub.values():
+            if len(idxs) < 2:
+                continue
+            base = idxs[0]
+            for j in idxs[1:]:
+                dsu.union(base, j)
+    return dsu
+
+
 def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
                                 tono_col="Tono IA", tema_col="Tema", subtema_col="Subtema",
                                 marca="", aliases=None,
@@ -3450,10 +3493,9 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
                                 grupos_noticia=None,
                                 embs=None,
                                 textos_canonicos=None,
-                                pbar=None):
-    # Asigna 'Grupo noticia' y unifica Tono IA / Tema / Subtema SOLO de noticias
-    # equivalentes. Tras Temas listos esto debe ser barato: reusa grupos de subtema
-    # y un grafo bloqueado (nunca n×n SequenceMatcher).
+                                pbar=None,
+                                saltar_grafo=None):
+    # Tras Temas listos: reusa last_grupos + mismo Subtema. No reconstruye el grafo.
     if df.empty:
         return df
     pbar = pbar or _PBarNulo()
@@ -3466,7 +3508,7 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
         else None
     )
 
-    pbar.progress(0.08, "Grupos")
+    pbar.progress(0.08, "Agrupación 0/1")
     df = df.copy()
     if subtema_col in df.columns:
         df[subtema_col] = df[subtema_col].apply(
@@ -3480,24 +3522,27 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
         f"{titulos[i]} {resumenes[i]}" for i in range(n)
     ]
 
-    pbar.progress(0.35, f"Grupos · grafo bloqueado ({n} filas)")
-    dsu = construir_grafo_equivalencia(
-        titulos, resumenes, contextos if contextos is not None else textos_analisis,
-        marca, aliases, embs=embs,
-    )
-    if grupos_noticia:
-        for idxs in grupos_noticia.values():
-            idxs = list(idxs)
-            if len(idxs) < 2:
-                continue
-            base = idxs[0]
-            for j in idxs[1:]:
-                if _hechos_nucleo_distinto(
-                    textos_analisis[base], textos_analisis[j], marca, aliases
-                ):
+    reusar_grupos = saltar_grafo if saltar_grafo is not None else (grupos_noticia is not None)
+    if reusar_grupos:
+        dsu = _dsu_desde_last_grupos_y_subtema(n, grupos_noticia, df, subtema_col)
+    else:
+        pbar.progress(0.35, f"Agrupación · grafo bloqueado ({n} filas)")
+        dsu = construir_grafo_equivalencia(
+            titulos, resumenes, contextos if contextos is not None else textos_analisis,
+            marca, aliases, embs=embs,
+        )
+        if grupos_noticia:
+            for idxs in grupos_noticia.values():
+                idxs = _indices_validos_grupo(idxs, n)
+                if len(idxs) < 2:
                     continue
-                dsu.union(base, j)
-    pbar.progress(0.7, f"Grupos · {_PARES_GRAFO_REVISADOS} pares")
+                base = idxs[0]
+                for j in idxs[1:]:
+                    if _hechos_nucleo_distinto(
+                        textos_analisis[base], textos_analisis[j], marca, aliases
+                    ):
+                        continue
+                    dsu.union(base, j)
 
     grupos_eq = defaultdict(list)
     for i in range(n):
@@ -3527,9 +3572,8 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
         return max(idxs, key=_score)
 
     n_eq = max(len(grupos_eq), 1)
-    for gi, idxs in enumerate(grupos_eq.values()):
-        if gi % 40 == 0:
-            pbar.progress(0.75 + 0.15 * (gi / n_eq), f"Grupos · etiquetas {gi}/{n_eq}")
+    for gi, idxs in enumerate(grupos_eq.values(), start=1):
+        pbar.progress(0.20 + 0.70 * (gi / n_eq), f"Agrupación {gi}/{n_eq}")
         if len(idxs) < 2:
             continue
         ri = _indice_representante(idxs)
@@ -3596,7 +3640,7 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
             df[tema_col] = _sanear_selectivo(
                 [str(x) for x in df[tema_col].tolist()], es_subtema=False
             )
-    pbar.progress(1.0, f"Consistencia lista · {_PARES_GRAFO_REVISADOS} pares")
+    pbar.progress(1.0, f"Agrupación {n_eq}/{n_eq}")
     return df
 
 
@@ -4178,12 +4222,13 @@ def clasificar_noticias_core(
         "Tema": temas,
         "Subtema": subtemas,
     })
-    grupos_noticia = getattr(clf, "last_grupos", None) if clf is not None else None
-    pbar.progress(0.85, "Grupos")
+    grupos_noticia = getattr(clf, "last_grupos", None) if clf is not None else {}
+    pbar.progress(0.85, "Agrupación")
     out = aplicar_consistencia_grupos(
         df, "Título", "Resumen - Aclaracion",
         marca=marca, aliases=aliases, vocabulario_tema=vocab_tema,
         grupos_noticia=grupos_noticia, embs=embs, textos_canonicos=textos, pbar=pbar,
+        saltar_grafo=True,
     )
     timer.mark("grupos", 1.0)
     summary = _registrar_timings(timer)
@@ -5252,9 +5297,11 @@ def correr_clasificacion(xlsx, marca, aliases_txt, pkl_tema, pkl_tono, usar_llm)
     resto = [c for c in merged.columns if c not in orden]
     merged = merged[orden + resto]
 
+    pbar.progress(0.96, "Escribiendo Excel")
     dest = Path("/tmp") / f"grill_clasificacion_{_safe_filename_part(marca)}.xlsx"
     with pd.ExcelWriter(dest, engine="openpyxl") as w:
         merged.to_excel(w, index=False, sheet_name="Clasificacion")
+    pbar.progress(1.0, "Escribiendo Excel")
     aviso = (
         f"Modelo `{MODELO_CLASIF_DEFAULT}`. "
         + (advertencia_modelo_clasificacion() or "")

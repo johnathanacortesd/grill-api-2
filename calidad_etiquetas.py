@@ -1,5 +1,7 @@
 # Quality-gate + repair for Grill-API (loaded into app.py via exec).
 # Conservative: only reject/repair BAD labels. Good noun phrases stay as-is.
+# Tras Temas listos: consistencia reusa last_grupos (no reconstruye el grafo)
+# y generate_output_excel no re-audita filas que ya traen Contexto analizado.
 
 MODELO_CLASIF_DEFAULT = "gpt-4.1-nano-2025-04-14"
 _MODELO_OVERRIDE_MSG = ""
@@ -1810,6 +1812,55 @@ def consolidar_temas(subtemas, textos, pbar, marca="", embs=None):
     return [capitalizar_etiqueta(_sin_comas_etiqueta(t)) for t in tf]
 
 
+_ETIQUETA_VACIA = {"", "nan", "none", "-", "n/a"}
+
+
+def _indices_validos_grupo(idxs, n):
+    out = []
+    for i in idxs or []:
+        try:
+            j = int(i)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= j < n:
+            out.append(j)
+    return out
+
+
+def _dsu_desde_last_grupos_y_subtema(n, grupos_noticia, df, subtema_col):
+    """Grupo noticia = last_grupos de procesar_lote + mismo string de Subtema.
+
+    No SequenceMatcher, no grafo de equivalencia.
+    """
+    dsu = DSU(n)
+    if grupos_noticia:
+        for idxs in grupos_noticia.values():
+            idxs = _indices_validos_grupo(idxs, n)
+            if len(idxs) < 2:
+                continue
+            base = idxs[0]
+            for j in idxs[1:]:
+                dsu.union(base, j)
+    if subtema_col in df.columns:
+        por_sub = defaultdict(list)
+        for i in range(n):
+            sub = str(df.iloc[i][subtema_col]).strip()
+            if sub.lower() in _ETIQUETA_VACIA:
+                continue
+            por_sub[sub].append(i)
+        for idxs in por_sub.values():
+            if len(idxs) < 2:
+                continue
+            base = idxs[0]
+            for j in idxs[1:]:
+                dsu.union(base, j)
+    return dsu
+
+
+def _fila_tiene_contexto(row):
+    return bool(str((row or {}).get("Contexto analizado") or "").strip())
+
+
 def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
                                 tono_col="Tono IA", tema_col="Tema", subtema_col="Subtema",
                                 marca="", aliases=None,
@@ -1817,7 +1868,8 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
                                 grupos_noticia=None,
                                 embs=None,
                                 textos_canonicos=None,
-                                pbar=None):
+                                pbar=None,
+                                saltar_grafo=None):
     if df.empty:
         return df
     pbar = pbar or _PBarNulo()
@@ -1835,22 +1887,29 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
     textos_analisis = textos_canonicos or contextos or [
         f"{titulos[i]} {resumenes[i]}" for i in range(n)
     ]
-    pbar.progress(0.35, f"Agrupación · grafo bloqueado ({n})")
-    dsu = construir_grafo_equivalencia(
-        titulos, resumenes,
-        contextos if contextos is not None else textos_analisis,
-        marca, aliases, embs=embs,
-    )
-    if grupos_noticia:
-        for idxs in grupos_noticia.values():
-            idxs = list(idxs)
-            if len(idxs) < 2:
-                continue
-            base = idxs[0]
-            for j in idxs[1:]:
-                if _hechos_nucleo_distinto(textos_analisis[base], textos_analisis[j], marca, aliases):
+    # Tras Temas listos: no reconstruir el grafo. last_grupos ya se calculó
+    # en procesar_lote; filas con el mismo Subtema también son el mismo grupo.
+    reusar_grupos = saltar_grafo if saltar_grafo is not None else (grupos_noticia is not None)
+    if reusar_grupos:
+        pbar.progress(0.08, "Agrupación 0/1")
+        dsu = _dsu_desde_last_grupos_y_subtema(n, grupos_noticia, df, subtema_col)
+    else:
+        pbar.progress(0.08, f"Agrupación · grafo bloqueado ({n})")
+        dsu = construir_grafo_equivalencia(
+            titulos, resumenes,
+            contextos if contextos is not None else textos_analisis,
+            marca, aliases, embs=embs,
+        )
+        if grupos_noticia:
+            for idxs in grupos_noticia.values():
+                idxs = _indices_validos_grupo(idxs, n)
+                if len(idxs) < 2:
                     continue
-                dsu.union(base, j)
+                base = idxs[0]
+                for j in idxs[1:]:
+                    if _hechos_nucleo_distinto(textos_analisis[base], textos_analisis[j], marca, aliases):
+                        continue
+                    dsu.union(base, j)
     grupos_eq = defaultdict(list)
     for i in range(n):
         grupos_eq[dsu.find(i)].append(i)
@@ -1874,11 +1933,16 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
             return (polar, calidad, len(sub.split()), len(_analisis_fila(i)))
         return max(idxs, key=_score)
 
-    for idxs in grupos_eq.values():
+    grupos_lista = list(grupos_eq.values())
+    n_eq = max(len(grupos_lista), 1)
+    for gi, idxs in enumerate(grupos_lista, start=1):
+        pbar.progress(0.20 + 0.70 * (gi / n_eq), f"Agrupación {gi}/{n_eq}")
         if len(idxs) < 2:
             continue
-        if any(_hechos_nucleo_distinto(_analisis_fila(idxs[0]), _analisis_fila(j), marca, aliases) for j in idxs[1:]):
-            # Only copy inside same-fact subsets
+        # Post-tema (last_grupos): copiar dentro del grupo, sin n² SequenceMatcher.
+        if reusar_grupos:
+            subsets = [idxs]
+        elif any(_hechos_nucleo_distinto(_analisis_fila(idxs[0]), _analisis_fila(j), marca, aliases) for j in idxs[1:]):
             dsu2 = DSU(len(idxs))
             for a in range(len(idxs)):
                 for b in range(a + 1, len(idxs)):
@@ -1950,7 +2014,7 @@ def aplicar_consistencia_grupos(df, titulo_col, resumen_col,
         df[tema_col] = _sanear_selectivo(
             [str(x) for x in df[tema_col].tolist()], es_subtema=False
         )
-    pbar.progress(1.0, f"Agrupación lista · {_PARES_GRAFO_REVISADOS} pares")
+    pbar.progress(1.0, f"Agrupación {n_eq}/{n_eq}")
     return df
 
 
@@ -1967,6 +2031,128 @@ def columnas_salida_xlsx(existentes=None):
                 order.append(c)
                 seen.add(c)
     return order
+
+
+def generate_output_excel(rows, km, pbar=None):
+    """Escribe el xlsx de una vez. Si la fila ya trae Contexto analizado, no re-audita."""
+    pbar = pbar or _PBarNulo()
+    pbar.progress(0.05, "Escribiendo Excel")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Resultado"
+    ORDER = [
+        "ID Noticia", "Fecha", "Hora", "Medio", "Tipo de Medio",
+        "Sección - Programa", "Región", "Título", "Autor - Conductor",
+        "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres",
+        "CPE", "Tier", "Audiencia", "Tono", "Tono IA", "Tema", "Subtema", "Grupo noticia",
+        "Link Nota", "Resumen - Aclaracion", "Link (Streaming - Imagen)", "Menciones - Empresa",
+        "ID duplicada",
+        "Cuerpo Completo",
+    ]
+    NUM = {"ID Noticia", "Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres", "CPE", "Tier", "Audiencia"}
+    ORDER += ["Contexto analizado", "Coincidencia marca", "Origen coincidencia"]
+    ws.append(ORDER)
+
+    font_hyperlink = Font(color="000000", underline=None)
+    align_left = Alignment(horizontal="left")
+    font_header = Font(bold=True)
+
+    for i, _col_name in enumerate(ORDER, start=1):
+        ws.cell(row=1, column=i).font = font_header
+
+    col_idx_map = {name: ORDER.index(name) + 1 for name in ORDER}
+    n_rows = max(len(rows or []), 1)
+    brand = ""
+    aliases = []
+    try:
+        brand = st.session_state.get("brand_name", "")
+        aliases = st.session_state.get("brand_aliases", [])
+    except Exception:
+        pass
+
+    for ri, row in enumerate(rows or []):
+        if ri == 0 or (ri + 1) == len(rows) or (ri + 1) % 40 == 0:
+            pbar.progress(0.10 + 0.80 * ((ri + 1) / n_rows), f"Escribiendo Excel {ri + 1}/{len(rows)}")
+        if _fila_tiene_contexto(row):
+            ctx = str(row.get("Contexto analizado") or "")
+            match = row.get("Coincidencia marca", "")
+            origin = row.get("Origen coincidencia", "")
+        else:
+            ctx, match, origin = _brand_audit(
+                row.get(km.get("titulo"), ""),
+                row.get(km.get("resumen"), ""),
+                brand,
+                aliases,
+            )
+        row["Contexto analizado"], row["Coincidencia marca"], row["Origen coincidencia"] = ctx, match, origin
+        tk = km.get("titulo")
+        if tk and tk in row:
+            row[tk] = clean_title_for_output(row.get(tk))
+        rk = km.get("resumen")
+        if rk and rk in row:
+            row[rk] = corregir_texto(row.get(rk))
+
+        out, links = [], {}
+        for ci, h in enumerate(ORDER, start=1):
+            val = row.get(h)
+            cv = None
+            if h == "Fecha" and pd.notna(val):
+                if isinstance(val, pd.Timestamp):
+                    cv = val.to_pydatetime()
+                elif isinstance(val, (datetime.datetime, datetime.date)):
+                    cv = val
+                else:
+                    cv = str(val) if val is not None else None
+            elif h in NUM:
+                cv = parse_numeric(val)
+            elif isinstance(val, dict) and "url" in val:
+                cv = val.get("value", "Link")
+                if val.get("url"):
+                    links[ci] = val["url"]
+            elif val is not None:
+                if isinstance(val, str) and val.startswith("http"):
+                    cv = "Link"
+                    links[ci] = val
+                else:
+                    cv = str(val)
+            out.append(cv)
+        ws.append(out)
+
+        current_row = ws.max_row
+        for ci, url in links.items():
+            cell = ws.cell(row=current_row, column=ci)
+            cell.hyperlink = url
+            cell.font = font_hyperlink
+            cell.alignment = align_left
+
+        date_col_idx = ORDER.index("Fecha") + 1
+        date_cell = ws.cell(row=current_row, column=date_col_idx)
+        if isinstance(date_cell.value, (datetime.datetime, datetime.date)):
+            date_cell.number_format = "DD/MM/YYYY"
+
+        cols_millares = ["Nro. Pagina", "Dimensión", "Duración - Nro. Caracteres", "Tier", "Audiencia"]
+        for col_name in cols_millares:
+            cell = ws.cell(row=current_row, column=col_idx_map[col_name])
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "#,##0"
+
+        cpe_cell = ws.cell(row=current_row, column=col_idx_map["CPE"])
+        if isinstance(cpe_cell.value, (int, float)):
+            cpe_cell.number_format = "$#,##0"
+
+    for i, col_name in enumerate(ORDER, start=1):
+        letter = ws.cell(row=1, column=i).column_letter
+        if col_name in ["Título", "Resumen - Aclaracion", "Cuerpo Completo"]:
+            ws.column_dimensions[letter].width = 50
+        elif col_name in ["Link Nota", "Link (Streaming - Imagen)"]:
+            ws.column_dimensions[letter].width = 15
+        else:
+            ws.column_dimensions[letter].width = 20
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    pbar.progress(1.0, "Escribiendo Excel")
+    return buf.getvalue()
 
 
 def clasificar_noticias_core(
@@ -2047,12 +2233,13 @@ def clasificar_noticias_core(
         "Tema": temas,
         "Subtema": subtemas,
     })
-    grupos_noticia = getattr(clf, "last_grupos", None) if clf is not None else None
+    grupos_noticia = getattr(clf, "last_grupos", None) if clf is not None else {}
     pbar.progress(0.88, "Agrupación")
     out = aplicar_consistencia_grupos(
         df, "Título", "Resumen - Aclaracion",
         marca=marca, aliases=aliases, vocabulario_tema=vocab_tema,
         grupos_noticia=grupos_noticia, embs=embs, textos_canonicos=textos, pbar=pbar,
+        saltar_grafo=True,
     )
     timer.mark("grupos", 1.0)
     summary = _registrar_timings(timer)

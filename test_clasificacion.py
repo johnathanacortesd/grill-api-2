@@ -1560,6 +1560,149 @@ class TestTemasGeneralesSinTope(unittest.TestCase):
             self.assertNotEqual(app.string_norm_label(tema), app.string_norm_label(sub), (tema, sub))
 
 
+class TestXlsxSinColgarTrasTemas(unittest.TestCase):
+    """Tras Temas listos: last_grupos, captions que se mueven, Excel sin re-audit."""
+
+    def test_consistencia_400_last_grupos_menos_1s_sin_matcher_all_pairs(self):
+        import time as _time
+        from difflib import SequenceMatcher
+        pd = __import__("pandas")
+        n = 400
+        titulos = [f"Zeta{i} anuncia hecho puntual {i} en Cali" for i in range(n)]
+        resumenes = [f"Resumen corto del hecho {i} en la jornada regional." for i in range(n)]
+        df = pd.DataFrame({
+            "Título": titulos,
+            "Resumen - Aclaracion": resumenes,
+            "Tono IA": ["Neutro"] * n,
+            "Tema": ["Hecho puntual"] * n,
+            "Subtema": [f"Hecho puntual {i}" for i in range(n)],
+        })
+        last_grupos = {i: [i, i + 1] for i in range(0, n, 2)}
+        orig_ratio = SequenceMatcher.ratio
+        calls = {"n": 0}
+
+        def spy_ratio(self):
+            calls["n"] += 1
+            return orig_ratio(self)
+
+        t0 = _time.perf_counter()
+        with patch.object(SequenceMatcher, "ratio", spy_ratio), \
+             patch.object(app, "construir_grafo_equivalencia",
+                          side_effect=AssertionError("no rebuild graph after Temas")):
+            out = app.aplicar_consistencia_grupos(
+                df, "Título", "Resumen - Aclaracion",
+                marca="ZetaCorp", grupos_noticia=last_grupos, saltar_grafo=True,
+            )
+        elapsed = _time.perf_counter() - t0
+        nxn = n * (n - 1) // 2
+        self.assertEqual(len(out), n)
+        self.assertLess(elapsed, 1.0, elapsed)
+        self.assertLess(calls["n"], n, calls["n"])
+        self.assertLess(calls["n"], nxn // 10, calls["n"])
+        self.assertTrue(all(str(g).startswith("G") for g in out["Grupo noticia"]))
+        self.assertEqual(out.loc[0, "Grupo noticia"], out.loc[1, "Grupo noticia"])
+        self.assertNotEqual(out.loc[0, "Grupo noticia"], out.loc[2, "Grupo noticia"])
+
+    def test_consistencia_mismo_subtema_une_sin_grafo(self):
+        pd = __import__("pandas")
+        df = pd.DataFrame({
+            "Título": ["Alpha uno", "Beta dos"],
+            "Resumen - Aclaracion": ["Resumen A", "Resumen B"],
+            "Tono IA": ["Positivo", "Neutro"],
+            "Tema": ["Educación superior", "Formación profesional"],
+            "Subtema": ["Lanzamiento de carrera deportiva", "Lanzamiento de carrera deportiva"],
+        })
+        with patch.object(app, "construir_grafo_equivalencia",
+                          side_effect=AssertionError("no graph")):
+            out = app.aplicar_consistencia_grupos(
+                df, "Título", "Resumen - Aclaracion",
+                marca="ZetaCorp", grupos_noticia={}, saltar_grafo=True,
+            )
+        self.assertEqual(out.loc[0, "Grupo noticia"], out.loc[1, "Grupo noticia"])
+        self.assertEqual(out.loc[0, "Tono IA"], out.loc[1, "Tono IA"])
+        self.assertEqual(out.loc[0, "Tema"], out.loc[1, "Tema"])
+        self.assertEqual(out.loc[0, "Subtema"], out.loc[1, "Subtema"])
+
+    def test_generate_output_excel_no_repite_brand_audit_si_hay_contexto(self):
+        rows = [{
+            "ID Noticia": 1,
+            "Título": "UTB lanza carrera de medicina deportiva en Cartagena",
+            "Resumen - Aclaracion": "La Universidad Tecnológica de Bolívar abre medicina deportiva.",
+            "Contexto analizado": "UTB lanza carrera. La UTB abre medicina deportiva.",
+            "Coincidencia marca": "UTB",
+            "Origen coincidencia": "Título",
+            "Tono IA": "Positivo",
+            "Tema": "Educación superior",
+            "Subtema": "Lanzamiento de carrera deportiva",
+            "Grupo noticia": "G00001",
+            "Link Nota": {"value": "Link", "url": "https://example.com/nota"},
+        }]
+        km = {"titulo": "Título", "resumen": "Resumen - Aclaracion"}
+        with patch.object(app, "_brand_audit", side_effect=AssertionError("no re-audit")) as mocked:
+            data = app.generate_output_excel(rows, km)
+        mocked.assert_not_called()
+        self.assertTrue(data and len(data) > 100)
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(data))
+        ws = wb.active
+        headers = [c.value for c in ws[1]]
+        self.assertIn("Contexto analizado", headers)
+        ctx_i = headers.index("Contexto analizado") + 1
+        self.assertIn("UTB", str(ws.cell(2, ctx_i).value))
+        link_i = headers.index("Link Nota") + 1
+        self.assertTrue(ws.cell(2, link_i).hyperlink)
+
+    def test_temas_listos_no_es_ultimo_tick(self):
+        pd = __import__("pandas")
+        spy = _PBarSpy()
+        n = 12
+        subs = [f"Hecho puntual {i}" for i in range(n)]
+        textos = [f"Resumen del hecho {i} en la jornada." for i in range(n)]
+        app.consolidar_temas(subs, textos, spy, "ZetaCorp")
+        df = pd.DataFrame({
+            "Título": [f"Titulo {i}" for i in range(n)],
+            "Resumen - Aclaracion": textos,
+            "Tono IA": ["Neutro"] * n,
+            "Tema": ["Hecho institucional"] * n,
+            "Subtema": subs,
+            "Contexto analizado": textos,
+        })
+        last_grupos = {i: [i] for i in range(n)}
+        app.aplicar_consistencia_grupos(
+            df, "Título", "Resumen - Aclaracion",
+            marca="ZetaCorp", grupos_noticia=last_grupos, pbar=spy, saltar_grafo=True,
+        )
+        rows = df.to_dict("records")
+        km = {"titulo": "Título", "resumen": "Resumen - Aclaracion"}
+        with patch.object(app, "_brand_audit", side_effect=AssertionError("no re-audit")):
+            app.generate_output_excel(rows, km, pbar=spy)
+        msgs = [str(m) for m in spy.msgs]
+        self.assertTrue(any("Temas listos" in m for m in msgs), msgs)
+        i_temas = max(i for i, m in enumerate(msgs) if "Temas listos" in m)
+        after = msgs[i_temas + 1:]
+        self.assertTrue(any("Agrupación" in m for m in after), after)
+        self.assertTrue(any("Excel" in m for m in after), after)
+        self.assertNotIn("Temas listos", msgs[-1])
+        self.assertNotIn("Máx:", " ".join(msgs))
+
+    def test_overlay_y_streamlit_parchean_post_temas(self):
+        from pathlib import Path
+        overlay = Path(app.__file__).with_name("calidad_etiquetas.py").read_text(encoding="utf-8")
+        streamlit = Path(app.__file__).read_text(encoding="utf-8")
+        colab = Path(app.__file__).with_name("Grill_API_Colab.txt").read_text(encoding="utf-8")
+        self.assertIn("def generate_output_excel", overlay)
+        self.assertIn("saltar_grafo", overlay)
+        self.assertIn("_dsu_desde_last_grupos_y_subtema", overlay)
+        self.assertIn("Escribiendo Excel", overlay)
+        self.assertIn("saltar_grafo=True", streamlit)
+        self.assertIn("pbar=pb", streamlit)
+        self.assertIn("Escribiendo Excel", streamlit)
+        self.assertIn("saltar_grafo=True", colab)
+        self.assertIn("Escribiendo Excel", colab)
+        self.assertNotIn("Máx:25", overlay)
+        self.assertNotIn("Máx:25", streamlit.split("exec(")[0])
+
+
 class TestTituloVideoSinCambio(unittest.TestCase):
     """Título with 'Video | …' stays unchanged in output."""
 

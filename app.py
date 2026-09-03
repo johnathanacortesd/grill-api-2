@@ -3398,7 +3398,7 @@ def read_and_normalize_dossier(sheet, region_map, internet_map):
 
     return df
 
-def generate_output_excel(rows, km):
+def generate_output_excel(rows, km, pbar=None):
     wb = Workbook()
     ws = wb.active
     ws.title = "Resultado"
@@ -3424,9 +3424,19 @@ def generate_output_excel(rows, km):
         cell.font = font_header
 
     col_idx_map = {name: ORDER.index(name) + 1 for name in ORDER}
+    if pbar is not None:
+        try:
+            pbar.progress(0.05, "Escribiendo Excel")
+        except TypeError:
+            pbar.progress(0.05, text="Escribiendo Excel")
         
     for row in rows:
-        ctx, match, origin = _brand_audit(row.get(km.get("titulo"), ""), row.get(km.get("resumen"), ""), st.session_state.get("brand_name", ""), st.session_state.get("brand_aliases", []))
+        if str(row.get("Contexto analizado") or "").strip():
+            ctx = str(row.get("Contexto analizado") or "")
+            match = row.get("Coincidencia marca", "")
+            origin = row.get("Origen coincidencia", "")
+        else:
+            ctx, match, origin = _brand_audit(row.get(km.get("titulo"), ""), row.get(km.get("resumen"), ""), st.session_state.get("brand_name", ""), st.session_state.get("brand_aliases", []))
         row["Contexto analizado"], row["Coincidencia marca"], row["Origen coincidencia"] = ctx, match, origin
         tk = km.get("titulo")
         if tk and tk in row: row[tk] = clean_title_for_output(row.get(tk))
@@ -3495,6 +3505,11 @@ def generate_output_excel(rows, km):
             
     buf = io.BytesIO()
     wb.save(buf)
+    if pbar is not None:
+        try:
+            pbar.progress(1.0, "Escribiendo Excel")
+        except TypeError:
+            pbar.progress(1.0, text="Escribiendo Excel")
     return buf.getvalue()
 
 
@@ -3604,6 +3619,12 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
         )
         _stage(0.22, "Contexto")
         with st.status("Contexto de marca...", expanded=True) as s:
+            audits = [
+                _brand_audit(r.get(km["titulo"], ""), r.get(km["resumen"], ""), bn, ba)
+                for _, r in df.iterrows()
+            ]
+            if audits:
+                df["Contexto analizado"], df["Coincidencia marca"], df["Origen coincidencia"] = zip(*audits)
             s.update(label="✓ Contexto", state="complete")
         _stage(0.30, "Embedding")
         with st.status("Embedding (un pase)...", expanded=True) as s:
@@ -3633,11 +3654,13 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
         _stage(0.62, "Subtema")
         with st.status("Paso 4 · Clasificación", expanded=True) as s:
             pb = st.progress(0, text="Subtema")
+            clf = None
             if "Solo Modelos PKL" in mode:
                 subtemas = ["N/A"] * len(ta)
                 temas    = ["N/A"] * len(ta)
             else:
-                subtemas = ClasificadorSubtema(bn, ba).procesar_lote(
+                clf = ClasificadorSubtema(bn, ba)
+                subtemas = clf.procesar_lote(
                     df["_txt"], pb, df[km["resumen"]], df[km["titulo"]],
                     embs=_embs_canon,
                 )
@@ -3652,11 +3675,16 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
             else:
                 df[km["tema"]] = temas
             df[km["tema"]] = _unificar_tema_por_subtema(df[km["tema"]].tolist(), df[km["subtema"]].tolist())
-            df = aplicar_consistencia_grupos(df, km["titulo"], km["resumen"],
-                                             km["tonoiai"], km["tema"], km["subtema"],
-                                             marca=bn, aliases=ba, embs=_embs_canon)
+            _stage(0.90, "Agrupación")
+            df = aplicar_consistencia_grupos(
+                df, km["titulo"], km["resumen"],
+                km["tonoiai"], km["tema"], km["subtema"],
+                marca=bn, aliases=ba, embs=_embs_canon,
+                grupos_noticia=getattr(clf, "last_grupos", None) if clf is not None else {},
+                pbar=pb, saltar_grafo=True,
+            )
             s.update(label="✓ Paso 4 · Clasificación", state="complete")
-        _stage(1.0, "Temas")
+        _stage(0.94, "Agrupación")
             
         rm2 = df.set_index("expanded_index").to_dict("index")
         for idx, row in enumerate(rows):
@@ -3672,7 +3700,9 @@ async def run_full_process_async(df_file, bn, ba, tpkl, epkl, mode, xlsx_bytes=N
     st.session_state["brand_name"] = bn
     st.session_state["brand_aliases"] = ba
     with st.status("Paso 5 · Informe", expanded=True) as s:
-        st.session_state["output_data"]     = generate_output_excel(rows, km)
+        _stage(0.96, "Escribiendo Excel")
+        pb_xlsx = st.progress(0, text="Escribiendo Excel")
+        st.session_state["output_data"]     = generate_output_excel(rows, km, pbar=pb_xlsx)
         st.session_state["output_filename"] = f"Informe_IA_{bn.replace(' ', '_')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         st.session_state["processing_complete"] = True
         st.session_state.update({
@@ -3700,13 +3730,17 @@ async def run_quick_async(df, tc, sc, bn, al):
         s.update(label="✓ Tono", state="complete")
     with st.status("Clasificación", expanded=True) as s:
         pb = st.progress(0, text="Subtema")
-        subtemas = ClasificadorSubtema(bn, al).procesar_lote(
+        clf = ClasificadorSubtema(bn, al)
+        subtemas = clf.procesar_lote(
             df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''), embs=_embs_canon
         )
         df['Subtema'] = subtemas
         temas = consolidar_temas(subtemas, df["_txt"].tolist(), pb, bn, embs=_embs_canon)
         df['Tema'] = _unificar_tema_por_subtema(temas, subtemas)
-        df = aplicar_consistencia_grupos(df, tc, sc, marca=bn, aliases=al, embs=_embs_canon)
+        df = aplicar_consistencia_grupos(
+            df, tc, sc, marca=bn, aliases=al, embs=_embs_canon,
+            grupos_noticia=clf.last_grupos, pbar=pb, saltar_grafo=True,
+        )
         s.update(label="✓ Clasificación", state="complete")
     df.drop(columns=['_txt'], inplace=True)
     _ti, _to, _te = _token_total()
@@ -3851,12 +3885,14 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
     # --- PASO 3: SUBTEMAS Y TEMAS ---
     with st.status("Paso 3 · Clasificando Subtemas y Temas...", expanded=True) as s:
         pb = st.progress(0)
+        clf = None
         
         # Subtemas
         if "Solo Modelos PKL" in mode:
             subtemas = ["N/A"] * len(df)
         else:
-            subtemas = ClasificadorSubtema(bn, al).procesar_lote(
+            clf = ClasificadorSubtema(bn, al)
+            subtemas = clf.procesar_lote(
                 df["_txt"], pb, df[sc].fillna(''), df[tc].fillna(''),
                 embs=_embs_canon,
             )
@@ -3876,8 +3912,18 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
 
         df['Subtema'] = subtemas
         df['Tema']    = _unificar_tema_por_subtema(temas, subtemas)
-        df = aplicar_consistencia_grupos(df, tc, sc, marca=bn, aliases=al, embs=_embs_canon)
+        df = aplicar_consistencia_grupos(
+            df, tc, sc, marca=bn, aliases=al, embs=_embs_canon,
+            grupos_noticia=getattr(clf, "last_grupos", None) if clf is not None else {},
+            pbar=pb, saltar_grafo=True,
+        )
         s.update(label="✓ Clasificación completada", state="complete")
+
+    pb_xlsx = st.progress(0, text="Escribiendo Excel")
+    try:
+        pb_xlsx.progress(0.5, "Escribiendo Excel")
+    except TypeError:
+        pb_xlsx.progress(0.5, text="Escribiendo Excel")
 
     # Escribir las 3 columnas adicionales al final en la hoja openpyxl respetando el formato original
     max_col = ws.max_column
@@ -3909,6 +3955,10 @@ async def run_custom_excel_async(file_bytes, tc, sc, bn, al, mode="API de OpenAI
 
     buf_out = io.BytesIO()
     wb.save(buf_out)
+    try:
+        pb_xlsx.progress(1.0, "Escribiendo Excel")
+    except TypeError:
+        pb_xlsx.progress(1.0, text="Escribiendo Excel")
 
     _ti, _to, _te = _token_total()
     ci = (_ti / 1e6) * PRICE_INPUT_1M

@@ -1422,79 +1422,97 @@ class TestCalidadNoRegresa(unittest.TestCase):
         ))
 
 
-class TestTemasAlrededorDe25(unittest.TestCase):
-    """~25 temas; acreditación ≠ estudiantes/egresados."""
+class _PBarSpy:
+    def __init__(self):
+        self.msgs = []
 
-    def test_dossier_sintetico_cerca_de_25_y_nucleos_separados(self):
-        dominios = [
-            ("Acreditación de alta calidad institucional",
-             "La universidad renovó su acreditación de alta calidad ante el ministerio."),
-            ("Estudiante en formación universitaria",
-             "Editor web y periodista egresado de la Universidad Autónoma de Occidente. "
-             "Estudiante en formación Universidad Autónoma de Occidente."),
-            ("Proyecto residencial de lujo",
-             "Diporto propone una experiencia residencial de lujo en Serena del Mar."),
-            ("Lanzamiento de carrera deportiva",
-             "La universidad lanza una nueva carrera de medicina deportiva en Cartagena."),
-            ("Investigación por fallas operativas",
-             "La institución enfrenta una investigación por fallas operativas en laboratorios."),
-            ("Convenio de formación profesional",
-             "La universidad firma un convenio de formación profesional con el SENA."),
-            ("Inauguración de laboratorio marino",
-             "Inauguraron el laboratorio de biotecnología marina en el campus costero."),
-            ("Protesta estudiantil por matrículas",
-             "Estudiantes marcharon en protesta por el alza de matrículas."),
-            ("Foro de innovación tecnológica",
-             "El foro de innovación tecnológica reunió a centros de investigación."),
-            ("Campaña de vacunación comunitaria",
-             "El hospital lideró una campaña de vacunación comunitaria en el valle."),
-            ("Inversión en infraestructura vial",
-             "Anunciaron inversión en infraestructura vial para el corredor regional."),
-            ("Premio de innovación académica",
-             "Recibieron un premio de innovación académica por el laboratorio."),
-            ("Exportación del sector avícola",
-             "El encuentro avícola analizó las oportunidades de exportación."),
-            ("Reforma de política ambiental",
-             "Presentaron una reforma de política ambiental para el río."),
-            ("Cierre de planta industrial",
-             "La empresa anunció el cierre de planta industrial en Buga."),
-            ("Alianza de cooperación científica",
-             "Suscribieron una alianza de cooperación científica con el SENA."),
-            ("Ranking de calidad hospitalaria",
-             "El hospital subió en el ranking de calidad hospitalaria nacional."),
-            ("Festival de cultura regional",
-             "Organizan un festival de cultura regional en el centro de Cali."),
-            ("Contratos de empleo temporal",
-             "Abrieron contratos de empleo temporal para egresados técnicos."),
-            ("Crisis energética del Caribe",
-             "Analizan la crisis energética del Caribe y las tarifas."),
-            ("Demanda por contaminación hídrica",
-             "Presentaron una demanda por contaminación hídrica del río."),
-            ("Apertura de sede universitaria",
-             "La universidad inauguró una nueva sede universitaria en Palmira."),
-            ("Programa de becas rurales",
-             "Lanzaron un programa de becas rurales para jóvenes del Pacífico."),
-            ("Auditoría de contratación pública",
-             "La contraloría abrió una auditoría de contratación pública."),
-            ("Cumbre de sostenibilidad ambiental",
-             "La cumbre de sostenibilidad ambiental reunió a gobernadores."),
-            ("Plataforma de trámites digitales",
-             "Estrenaron una plataforma de trámites digitales para matrículas."),
-            ("Huelga de personal médico",
-             "Hubo huelga de personal médico por el atraso de salarios."),
-            ("Ampliación del puerto marítimo",
-             "Aprobaron la ampliación del puerto marítimo de Buenaventura."),
-        ]
+    def progress(self, *args, **kwargs):
+        msg = kwargs.get("text")
+        if msg is None and len(args) > 1:
+            msg = args[1]
+        self.msgs.append(msg or "")
+
+
+class TestTemasGeneralesSinTope(unittest.TestCase):
+    """Temas más generales que sus subtemas; acreditación ≠ estudiantes/egresados.
+
+    Sin recorte a 18–30 / Máx:25: mejor N temas coherentes que 25 cubos mezclados.
+    """
+
+    _DOMINIOS = [
+        ("Acreditación de alta calidad institucional",
+         "La universidad renovó su acreditación de alta calidad ante el ministerio."),
+        ("Estudiante en formación universitaria",
+         "Editor web y periodista egresado de la Universidad Autónoma de Occidente. "
+         "Estudiante en formación Universidad Autónoma de Occidente."),
+        ("Proyecto residencial de lujo",
+         "Diporto propone una experiencia residencial de lujo en Serena del Mar."),
+        ("Lanzamiento de carrera deportiva",
+         "La universidad lanza una nueva carrera de medicina deportiva en Cartagena."),
+        ("Investigación por fallas operativas",
+         "La institución enfrenta una investigación por fallas operativas en laboratorios."),
+        ("Convenio de formación profesional",
+         "La universidad firma un convenio de formación profesional con el SENA."),
+        ("Inauguración de laboratorio marino",
+         "Inauguraron el laboratorio de biotecnología marina en el campus costero."),
+        ("Protesta estudiantil por matrículas",
+         "Estudiantes marcharon en protesta por el alza de matrículas."),
+        ("Foro de innovación tecnológica",
+         "El foro de innovación tecnológica reunió a centros de investigación."),
+        ("Campaña de vacunación comunitaria",
+         "El hospital lideró una campaña de vacunación comunitaria en el valle."),
+        ("Inversión en infraestructura vial",
+         "Anunciaron inversión en infraestructura vial para el corredor regional."),
+        ("Premio de innovación académica",
+         "Recibieron un premio de innovación académica por el laboratorio."),
+        ("Exportación del sector avícola",
+         "El encuentro avícola analizó las oportunidades de exportación."),
+        ("Reforma de política ambiental",
+         "Presentaron una reforma de política ambiental para el río."),
+        ("Cierre de planta industrial",
+         "La empresa anunció el cierre de planta industrial en Buga."),
+        ("Alianza de cooperación científica",
+         "Suscribieron una alianza de cooperación científica con el SENA."),
+        ("Ranking de calidad hospitalaria",
+         "El hospital subió en el ranking de calidad hospitalaria nacional."),
+        ("Festival de cultura regional",
+         "Organizan un festival de cultura regional en el centro de Cali."),
+        ("Contratos de empleo temporal",
+         "Abrieron contratos de empleo temporal para egresados técnicos."),
+        ("Crisis energética del Caribe",
+         "Analizan la crisis energética del Caribe y las tarifas."),
+        ("Demanda por contaminación hídrica",
+         "Presentaron una demanda por contaminación hídrica del río."),
+        ("Apertura de sede universitaria",
+         "La universidad inauguró una nueva sede universitaria en Palmira."),
+        ("Programa de becas rurales",
+         "Lanzaron un programa de becas rurales para jóvenes del Pacífico."),
+        ("Auditoría de contratación pública",
+         "La contraloría abrió una auditoría de contratación pública."),
+        ("Cumbre de sostenibilidad ambiental",
+         "La cumbre de sostenibilidad ambiental reunió a gobernadores."),
+        ("Plataforma de trámites digitales",
+         "Estrenaron una plataforma de trámites digitales para matrículas."),
+        ("Huelga de personal médico",
+         "Hubo huelga de personal médico por el atraso de salarios."),
+        ("Ampliación del puerto marítimo",
+         "Aprobaron la ampliación del puerto marítimo de Buenaventura."),
+    ]
+
+    def test_tema_mas_general_que_subtema_y_nucleos_separados(self):
         titulos, resumenes = [], []
-        for i, (tit, res) in enumerate(dominios):
+        for i, (tit, res) in enumerate(self._DOMINIOS):
             titulos.append(f"{tit} ({i})")
             resumenes.append(res)
         with patch.object(app, "get_embeddings_batch", return_value=[None] * len(titulos)):
             temas, subs = app.etiquetar_sin_llm(titulos, resumenes, MARCA_UAO, ALIAS_UAO)
             clustered = app.consolidar_temas(subs, resumenes, app._PBarNulo(), MARCA_UAO)
-        n_temas = len(set(clustered))
-        self.assertGreaterEqual(n_temas, 18, clustered)
-        self.assertLessEqual(n_temas, 30, n_temas)
+        for tema, sub in zip(clustered, subs):
+            self.assertNotEqual(
+                app.string_norm_label(tema),
+                app.string_norm_label(sub),
+                (tema, sub),
+            )
         idx_acred = 0
         idx_egres = 1
         self.assertNotEqual(
@@ -1510,6 +1528,36 @@ class TestTemasAlrededorDe25(unittest.TestCase):
                 "Acreditación institucional", "Estudiantes y egresados"
             )
         )
+
+    def test_consolidar_300_subtemas_pocos_segundos_sin_embeddings(self):
+        import time
+        n = 300
+        subs, textos = [], []
+        for i in range(n):
+            tit, res = self._DOMINIOS[i % len(self._DOMINIOS)]
+            subs.append(f"{tit} caso {i}")
+            textos.append(res)
+        spy = _PBarSpy()
+        t0 = time.perf_counter()
+        with patch.object(app, "get_embeddings_batch", side_effect=AssertionError("no extra embeddings")):
+            out = app.consolidar_temas(subs, textos, spy, MARCA_UAO)
+        elapsed = time.perf_counter() - t0
+        self.assertEqual(len(out), n)
+        self.assertLess(elapsed, 5.0, elapsed)
+        self.assertTrue(
+            any(re.search(r"Temas \d+/\d+", str(m)) for m in spy.msgs),
+            spy.msgs[:8],
+        )
+        self.assertNotIn("Máx:", " ".join(str(m) for m in spy.msgs))
+        idx_acred = 0
+        idx_egres = 1
+        self.assertNotEqual(
+            app.string_norm_label(out[idx_acred]),
+            app.string_norm_label(out[idx_egres]),
+            (out[idx_acred], out[idx_egres], subs[idx_acred], subs[idx_egres]),
+        )
+        for tema, sub in zip(out, subs):
+            self.assertNotEqual(app.string_norm_label(tema), app.string_norm_label(sub), (tema, sub))
 
 
 class TestTituloVideoSinCambio(unittest.TestCase):

@@ -253,7 +253,7 @@ MAX_PALABRAS_FRASE_EVENTO    = 8
 # ── Umbrales base (corpus grande ≥ 20 noticias) ──────────────────────────────
 UMBRAL_SUBTEMA = 0.78
 UMBRAL_TEMA    = 0.72
-NUM_TEMAS_MAX  = 15
+NUM_TEMAS_MAX  = 25
 
 UMBRAL_DEDUP_LABEL           = 0.86
 UMBRAL_FUSION_SUBTEMAS       = 0.88
@@ -1610,7 +1610,7 @@ _DOMINIOS_TEMA = [
     (r"\b(cultura|patrimonio|festival|libro)\b", "Cultura y patrimonio"),
     (r"\b(empleo|trabajo|laboral|contratacion)\b", "Empleo y trabajo"),
     (r"\b(ambiental|sostenib|clima|energia)\b", "Sostenibilidad ambiental"),
-    (r"\b(egresad|alumni|graduad)\b", "Egresados"),
+    (r"\b(egresad|alumni|graduad|estudiante en formacion|afiliacion academica)\b", "Estudiantes y egresados"),
     (r"\b(acreditaci|certificaci|alta calidad)\b", "Acreditación institucional"),
     (r"\b(periodista|editor|autor[ií]a|byline)\b", "Autoría periodística"),
 ]
@@ -2121,10 +2121,10 @@ def _objeto_tras_evento_nominal(texto) -> str:
     return ""
 
 
-SUBTEMA_AUTORIA = "Artículo periodístico"
-_TEMA_AUTORIA_EGRESADOS = "Egresados"
-_TEMA_AUTORIA_ESTUDIANTES = "Estudiantes"
-_TEMA_AUTORIA_GENERAL = "Autoría periodística"
+SUBTEMA_AUTORIA = "Afiliación académica de egresados"
+_TEMA_AUTORIA_EGRESADOS = "Estudiantes y egresados"
+_TEMA_AUTORIA_ESTUDIANTES = "Estudiantes y egresados"
+_TEMA_AUTORIA_GENERAL = "Estudiantes y egresados"
 
 _RE_CREDITO_ROL = re.compile(
     r'\b(editor(?:a)?(?:\s+web)?|periodista|comunicador(?:a)?|redactor(?:a)?|'
@@ -2146,7 +2146,18 @@ def _norm_autoria_key(s) -> str:
 
 def _es_subtema_autoria(etiqueta) -> bool:
     n = _norm_autoria_key(etiqueta)
-    return n in {"articuloperiodistico", "articuloperiodista"} or n.startswith("articuloperiodistic")
+    if not n:
+        return False
+    if n in {"articuloperiodistico", "articuloperiodista"} or n.startswith("articuloperiodistic"):
+        return True
+    return any(
+        tok in n
+        for tok in (
+            "afiliacionacademica", "afiliaciondeestudiante", "estudianteenformacion",
+            "periodistaegresado", "creditoperiodistico", "estudiantesegresados",
+            "egresadodelainstitucion", "estudianteyegresado",
+        )
+    )
 
 
 def _es_oracion_credito(oracion) -> bool:

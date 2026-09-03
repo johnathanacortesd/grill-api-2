@@ -598,8 +598,9 @@ class TestSubtemaHechoNominal(unittest.TestCase):
                 self._assert_residencial_lujo(subtemas[0])
 
     def test_no_une_tokens_sueltos_con_de(self):
-        import inspect
-        src = inspect.getsource(app._extraer_subtema_especifico)
+        from pathlib import Path
+        src = Path(app.__file__).with_name("calidad_etiquetas.py").read_text(encoding="utf-8")
+        src += Path(app.__file__).read_text(encoding="utf-8")
         self.assertNotIn("join(top", src)
         self.assertNotIn("_palabras_contenido_evento", src)
         self.assertFalse(hasattr(app, "_palabras_contenido_evento"))
@@ -1025,8 +1026,11 @@ class TestDuplicadosLimpiezaGrill(unittest.TestCase):
     def test_detectar_duplicados_no_usa_sequence_matcher_de_titulo(self):
         import inspect
         src = inspect.getsource(app.detectar_duplicados_avanzado)
-        self.assertNotIn("SequenceMatcher", src)
+        # Title-as-duplicate (internet buckets) stays gone. SequenceMatcher is
+        # only allowed inside the radio/TV fecha+hora slot.
         self.assertNotIn("tb[(medio", src)
+        internet = src.split("elif tipo in")[0]
+        self.assertNotIn("SequenceMatcher", internet)
 
 
 class TestGrupoNoticiaCoberturaSimilar(unittest.TestCase):
@@ -1166,7 +1170,10 @@ class TestScrapsYAutoriaBylines(unittest.TestCase):
                 self.assertTrue(app._es_pegamento_de_tokens(scrap, titulo), scrap)
                 self.assertFalse(app._es_pegamento_de_tokens(subs[0], titulo + " " + CTX_UAO_BYLINE), subs[0])
                 self.assertTrue(app._es_subtema_autoria(subs[0]), subs[0])
-                self.assertEqual(app.string_norm_label(temas[0]), app.string_norm_label("Egresados"))
+                self.assertEqual(
+                    app.string_norm_label(temas[0]),
+                    app.string_norm_label("Estudiantes y egresados"),
+                )
 
     def test_byline_marca_no_universitaria(self):
         marca = "Hospital Nubaria"
@@ -1261,10 +1268,261 @@ class TestVelocidadDossier410(unittest.TestCase):
         self.assertFalse(produced & scraps, produced & scraps)
         self.assertTrue(all(app._es_subtema_autoria(s) for s in df["Subtema"].head(15)), df["Subtema"].head(3).tolist())
         self.assertTrue(
-            all(app.string_norm_label(t) == app.string_norm_label("Egresados") for t in df["Tema"].head(15)),
+            all(app.string_norm_label(t) == app.string_norm_label("Estudiantes y egresados") for t in df["Tema"].head(15)),
             df["Tema"].head(3).tolist(),
         )
         self.assertTrue(app._LAST_PHASE_TIMINGS, "faltan timings de fase")
+
+
+TITULO_UAO_ACRED_A = (
+    "Universidad Autónoma de Occidente recibe máxima acreditación del "
+    "Ministerio de Educación por su calidad académica e impacto regional"
+)
+TITULO_UAO_ACRED_B = (
+    "Universidad Autónoma de Occidente renueva su acreditación de alta calidad por 8 años"
+)
+RESUMEN_UAO_ACRED_A = (
+    "La Universidad Autónoma de Occidente recibió la acreditación de alta calidad "
+    "del Ministerio de Educación Nacional por su calidad académica e impacto regional."
+)
+RESUMEN_UAO_ACRED_B = (
+    "La Universidad Autónoma de Occidente renovó su acreditación de alta calidad por 8 años."
+)
+
+
+class TestCollageDeRechazado(unittest.TestCase):
+    """Bug 1: keyword collage glued with 'de' must be rejected and repaired."""
+
+    def test_collage_x_de_y_se_rechaza(self):
+        scraps = (
+            "Calidad de académica",
+            "Canal de único",
+            "Clima de hara",
+            "Tierra de redonda",
+            "Tengo de multa",
+        )
+        fuente = (
+            "Diporto propone una experiencia residencial de lujo en el Gran Canal. "
+            "Único en su tipo, este desarrollo invita a habitar."
+        )
+        for scrap in scraps:
+            with self.subTest(scrap=scrap):
+                self.assertTrue(app._es_pegamento_de_tokens(scrap, fuente), scrap)
+                self.assertTrue(app._subtema_de_baja_calidad(scrap, fuente), scrap)
+                repaired = app._asegurar_etiqueta_especifica(scrap, fuente, "Diporto", None)
+                self.assertFalse(app._es_pegamento_de_tokens(repaired, fuente), repaired)
+                self.assertGreaterEqual(len(repaired.split()), 4, repaired)
+                self.assertTrue(app._validar_estructura_subtema(repaired), repaired)
+
+    def test_frase_gramatical_4_palabras_se_usa(self):
+        fuente = CTX_DIPORTO
+        sub = app._extraer_subtema_especifico(fuente, "Diporto", None)
+        self.assertGreaterEqual(len(sub.split()), 4, sub)
+        self.assertFalse(app._es_pegamento_de_tokens(sub, fuente), sub)
+        self.assertIn("residencial", app.unidecode(sub.lower()))
+
+
+class TestUaoAcreditacionUnifica(unittest.TestCase):
+    """Bug 2: same accreditation fact → one subtema and one Grupo noticia."""
+
+    def test_dos_titulos_misma_acreditacion(self):
+        pd = __import__("pandas")
+        df = pd.DataFrame({
+            "Título": [TITULO_UAO_ACRED_A, TITULO_UAO_ACRED_B],
+            "Resumen - Aclaracion": [RESUMEN_UAO_ACRED_A, RESUMEN_UAO_ACRED_B],
+            "Contexto analizado": [RESUMEN_UAO_ACRED_A, RESUMEN_UAO_ACRED_B],
+            "Tono IA": ["Positivo", "Neutro"],
+            "Tema": ["Reconocimiento de alta calidad académica", "Reconocimiento de calidad institucional"],
+            "Subtema": [
+                "Reconocimiento de alta calidad académica",
+                "Reconocimiento de calidad institucional",
+            ],
+        })
+        with patch.object(app, "get_embeddings_batch", return_value=[None, None]):
+            temas, subs = app.etiquetar_sin_llm(
+                [TITULO_UAO_ACRED_A, TITULO_UAO_ACRED_B],
+                [RESUMEN_UAO_ACRED_A, RESUMEN_UAO_ACRED_B],
+                MARCA_UAO, ALIAS_UAO,
+            )
+            out = app.aplicar_consistencia_grupos(
+                df, "Título", "Resumen - Aclaracion",
+                marca=MARCA_UAO, aliases=ALIAS_UAO,
+            )
+        self.assertEqual(app.string_norm_label(subs[0]), app.string_norm_label(subs[1]), subs)
+        self.assertGreaterEqual(len(subs[0].split()), 4, subs[0])
+        self.assertTrue(
+            any(tok in app.unidecode(subs[0].lower()) for tok in ("acredit", "calidad")),
+            subs[0],
+        )
+        self.assertFalse(app._es_pegamento_de_tokens(subs[0], RESUMEN_UAO_ACRED_A), subs[0])
+        self.assertEqual(out.loc[0, "Grupo noticia"], out.loc[1, "Grupo noticia"])
+        self.assertEqual(out.loc[0, "Subtema"], out.loc[1, "Subtema"])
+        self.assertEqual(out.loc[0, "Tema"], out.loc[1, "Tema"])
+        self.assertEqual(temas[0], temas[1])
+
+
+class TestAfiliacionGenerica(unittest.TestCase):
+    """Affiliation/byline of any client → Neutro + Estudiantes y egresados."""
+
+    def test_egresado_estudiante_byline_neutro_y_tema(self):
+        with patch.object(app, "get_embeddings_batch", return_value=[None]), \
+             patch.object(app.openai.ChatCompletion, "create", side_effect=AssertionError("no LLM")):
+            out = app.clasificar_noticias_core(
+                ["¿Qué clima hará en Cali este lunes?"],
+                [CTX_UAO_BYLINE],
+                MARCA_UAO, ALIAS_UAO, usar_llm=False,
+            )
+        self.assertEqual(out.loc[0, "Tono IA"], "Neutro")
+        self.assertEqual(
+            app.string_norm_label(out.loc[0, "Tema"]),
+            app.string_norm_label("Estudiantes y egresados"),
+        )
+        self.assertTrue(app._es_subtema_autoria(out.loc[0, "Subtema"]), out.loc[0, "Subtema"])
+        self.assertGreaterEqual(len(str(out.loc[0, "Subtema"]).split()), 4)
+        self.assertNotIn("acredit", app.unidecode(str(out.loc[0, "Subtema"]).lower()))
+
+    def test_afiliacion_es_generica_no_solo_uao(self):
+        marca = "Hospital Nubaria"
+        ctx = (
+            "Editora web y periodista egresada de Hospital Nubaria. "
+            "Estudiante en formación Hospital Nubaria."
+        )
+        temas, subs = app.etiquetar_sin_llm(
+            ["Notas del día en Cali"], [ctx], marca, None
+        )
+        self.assertEqual(
+            app.string_norm_label(temas[0]),
+            app.string_norm_label("Estudiantes y egresados"),
+        )
+        self.assertTrue(app._es_subtema_autoria(subs[0]), subs[0])
+
+
+class TestCalidadNoRegresa(unittest.TestCase):
+    """Known-good Diporto-style phrases must still be produced."""
+
+    def test_proyecto_residencial_de_lujo_se_conserva(self):
+        for marca, aliases in (("Diporto", None), ("Serena del Mar", None)):
+            with self.subTest(marca=marca):
+                sub = app._extraer_subtema_especifico(CTX_DIPORTO, marca, aliases)
+                n = app.unidecode(sub.lower())
+                self.assertFalse(app._subtema_de_baja_calidad(sub, CTX_DIPORTO), sub)
+                self.assertTrue(
+                    ("residencial" in n and ("lujo" in n or "serena" in n or "proyecto" in n))
+                    or ("proyecto" in n and ("residencial" in n or "lujo" in n)),
+                    sub,
+                )
+                self.assertGreaterEqual(len(sub.split()), 4, sub)
+
+    def test_lanzamiento_carrera_sigue_siendo_valido(self):
+        self.assertTrue(app._validar_estructura_subtema("Lanzamiento de carrera deportiva"))
+        self.assertTrue(app._candidato_subtema_ok(
+            "Lanzamiento de carrera deportiva",
+            "La UTB lanza una carrera de medicina deportiva.",
+            MARCA, ALIAS,
+        ))
+
+
+class TestTemasAlrededorDe25(unittest.TestCase):
+    """~25 temas; acreditación ≠ estudiantes/egresados."""
+
+    def test_dossier_sintetico_cerca_de_25_y_nucleos_separados(self):
+        dominios = [
+            ("Acreditación de alta calidad institucional",
+             "La universidad renovó su acreditación de alta calidad ante el ministerio."),
+            ("Estudiante en formación universitaria",
+             "Editor web y periodista egresado de la Universidad Autónoma de Occidente. "
+             "Estudiante en formación Universidad Autónoma de Occidente."),
+            ("Proyecto residencial de lujo",
+             "Diporto propone una experiencia residencial de lujo en Serena del Mar."),
+            ("Lanzamiento de carrera deportiva",
+             "La universidad lanza una nueva carrera de medicina deportiva en Cartagena."),
+            ("Investigación por fallas operativas",
+             "La institución enfrenta una investigación por fallas operativas en laboratorios."),
+            ("Convenio de formación profesional",
+             "La universidad firma un convenio de formación profesional con el SENA."),
+            ("Inauguración de laboratorio marino",
+             "Inauguraron el laboratorio de biotecnología marina en el campus costero."),
+            ("Protesta estudiantil por matrículas",
+             "Estudiantes marcharon en protesta por el alza de matrículas."),
+            ("Foro de innovación tecnológica",
+             "El foro de innovación tecnológica reunió a centros de investigación."),
+            ("Campaña de vacunación comunitaria",
+             "El hospital lideró una campaña de vacunación comunitaria en el valle."),
+            ("Inversión en infraestructura vial",
+             "Anunciaron inversión en infraestructura vial para el corredor regional."),
+            ("Premio de innovación académica",
+             "Recibieron un premio de innovación académica por el laboratorio."),
+            ("Exportación del sector avícola",
+             "El encuentro avícola analizó las oportunidades de exportación."),
+            ("Reforma de política ambiental",
+             "Presentaron una reforma de política ambiental para el río."),
+            ("Cierre de planta industrial",
+             "La empresa anunció el cierre de planta industrial en Buga."),
+            ("Alianza de cooperación científica",
+             "Suscribieron una alianza de cooperación científica con el SENA."),
+            ("Ranking de calidad hospitalaria",
+             "El hospital subió en el ranking de calidad hospitalaria nacional."),
+            ("Festival de cultura regional",
+             "Organizan un festival de cultura regional en el centro de Cali."),
+            ("Contratos de empleo temporal",
+             "Abrieron contratos de empleo temporal para egresados técnicos."),
+            ("Crisis energética del Caribe",
+             "Analizan la crisis energética del Caribe y las tarifas."),
+            ("Demanda por contaminación hídrica",
+             "Presentaron una demanda por contaminación hídrica del río."),
+            ("Apertura de sede universitaria",
+             "La universidad inauguró una nueva sede universitaria en Palmira."),
+            ("Programa de becas rurales",
+             "Lanzaron un programa de becas rurales para jóvenes del Pacífico."),
+            ("Auditoría de contratación pública",
+             "La contraloría abrió una auditoría de contratación pública."),
+            ("Cumbre de sostenibilidad ambiental",
+             "La cumbre de sostenibilidad ambiental reunió a gobernadores."),
+            ("Plataforma de trámites digitales",
+             "Estrenaron una plataforma de trámites digitales para matrículas."),
+            ("Huelga de personal médico",
+             "Hubo huelga de personal médico por el atraso de salarios."),
+            ("Ampliación del puerto marítimo",
+             "Aprobaron la ampliación del puerto marítimo de Buenaventura."),
+        ]
+        titulos, resumenes = [], []
+        for i, (tit, res) in enumerate(dominios):
+            titulos.append(f"{tit} ({i})")
+            resumenes.append(res)
+        with patch.object(app, "get_embeddings_batch", return_value=[None] * len(titulos)):
+            temas, subs = app.etiquetar_sin_llm(titulos, resumenes, MARCA_UAO, ALIAS_UAO)
+            clustered = app.consolidar_temas(subs, resumenes, app._PBarNulo(), MARCA_UAO)
+        n_temas = len(set(clustered))
+        self.assertGreaterEqual(n_temas, 18, clustered)
+        self.assertLessEqual(n_temas, 30, n_temas)
+        idx_acred = 0
+        idx_egres = 1
+        self.assertNotEqual(
+            app.string_norm_label(clustered[idx_acred]),
+            app.string_norm_label(clustered[idx_egres]),
+            (clustered[idx_acred], clustered[idx_egres], subs[idx_acred], subs[idx_egres]),
+        )
+        self.assertFalse(
+            app._temas_nucleo_incompatible(clustered[idx_acred], clustered[idx_acred])
+        )
+        self.assertTrue(
+            app._temas_nucleo_incompatible(
+                "Acreditación institucional", "Estudiantes y egresados"
+            )
+        )
+
+
+class TestTituloVideoSinCambio(unittest.TestCase):
+    """Título with 'Video | …' stays unchanged in output."""
+
+    def test_video_pipe_se_conserva(self):
+        raw = "Video | UTB lanza carrera de medicina deportiva en Cartagena"
+        self.assertEqual(app.clean_title_for_output(raw), raw)
+        self.assertIn("Video |", app.clean_title_for_output(raw))
+        # Grouping still uses the real headline, not 'Video'
+        norm = app.normalize_title_for_comparison(raw)
+        self.assertIn("carrera", norm)
+        self.assertIn("video", norm)
 
 
 if __name__ == "__main__":
